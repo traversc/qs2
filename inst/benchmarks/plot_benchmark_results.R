@@ -9,8 +9,8 @@ set_string_ops("&", "|")
 
 options(warn=1)
 
-PLATFORM <- "mac"
-algo_subset <- c("qs-legacy", "qs2", "qdata")
+PLATFORM <- "ubuntu"
+algo_subset <- c("qs2", "base_serialize", "rds")
 for(DATASET in c("enwik8", "gaia", "mnist", "tcell")) {
 print(DATASET)
 df <- fread("%s/results/%s_serialization_benchmarks_%s.csv" | c(this.dir(), PLATFORM, DATASET)) %>%
@@ -114,20 +114,32 @@ ggsave(g, file = "%s/plots/%s_combined_benchmark_plot.png" | c(this.dir(), PLATF
 #                        object_size = c(146242320, 288986496, 219801584, 293786648)) %>%
 #   mutate(object_size = object_size / 1048576)
 
-total_size <- (146242320 + 288986496 + 293786648) / 1048576
+total_size <- (146242320 + 288986496 + 219801584 + 293786648) / 1048576
 
-algo_subset <- c("qs2", "qdata","qs-legacy", "rds", "base_serialize", "fst", "parquet")
-df <- lapply( c("enwik8", "gaia", "tcell"), function(DATASET) {
+algo_subset <- c("qs2","rds", "base_serialize")
+df <- lapply( c("enwik8", "gaia", "mnist", "tcell"), function(DATASET) {
   fread("%s/results/%s_serialization_benchmarks_%s.csv" | c(this.dir(), PLATFORM, DATASET)) %>%
     filter(algo %in% algo_subset) %>%
     # filter for defaults
-    filter( (algo %like% "^q" & compress_level == 5) |
+    filter( (algo %like% "^q" & compress_level == 3) |
             (algo == "rds") | 
             (algo == "base_serialize") | 
             (algo == "fst" & compress_level  == 55) |
             (algo == "parquet" & compress_level == 5)) %>%
     mutate(dataset = DATASET)
 }) %>% rbindlist
+df2 <- lapply( c( "mnist"), function(DATASET) {
+  fread("%s/results/%s_serialization_benchmarks_%s2.csv" | c(this.dir(), PLATFORM, DATASET)) %>%
+    filter(algo %in% algo_subset) %>%
+    # filter for defaults
+    filter( (algo %like% "^q" & compress_level == 3) |
+              (algo == "rds") | 
+              (algo == "base_serialize") | 
+              (algo == "fst" & compress_level  == 55) |
+              (algo == "parquet" & compress_level == 5)) %>%
+    mutate(dataset = DATASET)
+}) %>% rbindlist
+df <- rbind(df, df2)
 
 df <- df %>% 
   group_by(algo, nthreads, rep) %>%
@@ -145,4 +157,4 @@ dfs <- df %>%
   mutate(compression = total_size / file_size) %>%
   transmute(algorithm=algo, nthreads, save_time, read_time, compression)
 
-fwrite(dfs, file = "results/%s_benchmark_summary_table.csv" | PLATFORM, sep = ",")
+fwrite(dfs, file = "~/Desktop/r_serialization_plots/mac_r_serialize_benchmark_summary_table.csv", sep = ",")

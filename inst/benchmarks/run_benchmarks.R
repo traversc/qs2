@@ -23,9 +23,9 @@ DATA_PATH <- "../../local"
 OUTPUT_PATH <- "../../local/TEMP"
 TMP_RESULTS_PATH <- tempfile()
 
-tests_datasets <- c("enwik8") #, "gaia", "tcell", "mnist")
-test_algos <- c("qs-legacy", "qs2", "qdata", "fst", "parquet", "rds", "base_serialize")
-# test_algos <- c("qs-legacy", "qs2", "qdata")
+tests_datasets <- c("mnist")
+# test_algos <- c("qs-legacy", "qs2", "qdata", "fst", "parquet", "rds", "base_serialize")
+test_algos <- c("base_serialize", "rds")
 for(DATASET in tests_datasets) {
 if(DATASET == "enwik8") {
   DATA <- fread(DATA_PATH & "/enwik8.csv.gz", sep = ",", data.table=FALSE, colClasses = "character")
@@ -44,7 +44,7 @@ if(DATASET == "enwik8") {
 # mnist: 219801584
 # tcell: 293786648
 
-reps <- 1:5
+reps <- 1:3
 compress_levels <- c(1,3,5,7,9,11)
 fst_compress_levels <- seq(10,85,by=15)
 grid <- rbind(
@@ -57,7 +57,7 @@ grid <- rbind(
   expand.grid(algo = "parquet", compress_level = compress_levels, nthreads=c(1,4), rep=reps, stringsAsFactors = FALSE)) %>% sample_n(nrow(.))
 
 grid <- filter(grid, algo %in% test_algos)
-if(DATASET == "mnist") grid <- filter(grid, algo %in% c("qs-legacy", "qs2", "qdata")) # mnist is not a dataframe
+if(DATASET == "mnist") grid <- filter(grid, algo %in% c("qs-legacy", "qs2", "qdata", "rds", "base_serialize")) # mnist is not a dataframe
 
 res <- lapply(1:nrow(grid), function(i) {
   print(i)
@@ -102,7 +102,7 @@ res <- lapply(1:nrow(grid), function(i) {
 }) %>% rbindlist
 res <- cbind(grid, res)
 
-output_file <- "%s/results/%s_serialization_benchmarks_%s.csv" | c(this.dir(), PLATFORM, DATASET)
+output_file <- "%s/results/%s_serialization_benchmarks_%s2.csv" | c(this.dir(), PLATFORM, DATASET)
 fwrite(res, file = output_file, sep = ",")
 
 }
