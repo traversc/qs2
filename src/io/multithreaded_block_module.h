@@ -75,60 +75,54 @@ struct BlockCompressWriterMT {
     tgc(),
     myGraph(this->tgc),
     compressor_node(this->myGraph, tbb::flow::unlimited, 
-        [this](OrderedBlock block) {
-                        // get zblock from available_zblocks
-            OrderedBlock zblock;
-            if(!available_zblocks.try_pop(zblock.block)) {
-                zblock.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_ZBLOCKSIZE);
-            }
-            // do thread local compression
-            typename tbb::enumerable_thread_specific<compressor>::reference cp_local = cp.local();
-            zblock.blocksize = cp_local.compress(zblock.block.get(), MAX_ZBLOCKSIZE, 
-                                                 block.block.get(), block.blocksize,
-                                                 compress_level);
-            zblock.blocknumber = block.blocknumber;
-            
-            // return input block to available_blocks
-            available_blocks.push(block.block);
-            return zblock;
-        }),
-    compressor_node_direct(this->myGraph, tbb::flow::unlimited, 
-        [this](OrderedPtr ptr) {
-                        // get zblock from available_zblocks
-            OrderedBlock zblock;
-            if(!available_zblocks.try_pop(zblock.block)) {
-                zblock.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_ZBLOCKSIZE);
-            }
-            // do thread local compression
-            typename tbb::enumerable_thread_specific<compressor>::reference cp_local = cp.local();
-            zblock.blocksize = cp_local.compress(zblock.block.get(), MAX_ZBLOCKSIZE, 
-                                                 ptr.block, MAX_BLOCKSIZE,
-                                                 compress_level);
-            zblock.blocknumber = ptr.blocknumber;
-            return zblock;
-        }),
-    sequencer_node(this->myGraph,
-        [](OrderedBlock zblock) {
-            return zblock.blocknumber;
-        }),
-    writer_node(this->myGraph, tbb::flow::serial,
-        [this](OrderedBlock zblock) {
-            write_and_update(static_cast<uint32_t>(zblock.blocksize));
-            write_and_update(zblock.block.get(), zblock.blocksize & (~BLOCK_METADATA));
-
-            // return input zblock to available_zblocks
-            available_zblocks.push(zblock.block);
-
-            // return 0 to indicate success
-            return 0;
-        }) {
-
-        // pre-populate available blocks and zblocks queues
-        // for(int i = 0; i < nthreads-1; ++i) {
-        //     available_blocks.push(MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_BLOCKSIZE));
-        //     available_zblocks.push(MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_ZBLOCKSIZE));
-        // }
+    [this](OrderedBlock block) {
+                    // get zblock from available_zblocks
+        OrderedBlock zblock;
+        if(!available_zblocks.try_pop(zblock.block)) {
+            zblock.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_ZBLOCKSIZE);
+        }
+        // do thread local compression
+        typename tbb::enumerable_thread_specific<compressor>::reference cp_local = cp.local();
+        zblock.blocksize = cp_local.compress(zblock.block.get(), MAX_ZBLOCKSIZE, 
+                                                block.block.get(), block.blocksize,
+                                                compress_level);
+        zblock.blocknumber = block.blocknumber;
         
+        // return input block to available_blocks
+        available_blocks.push(block.block);
+        return zblock;
+    }),
+    compressor_node_direct(this->myGraph, tbb::flow::unlimited, 
+    [this](OrderedPtr ptr) {
+                    // get zblock from available_zblocks
+        OrderedBlock zblock;
+        if(!available_zblocks.try_pop(zblock.block)) {
+            zblock.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_ZBLOCKSIZE);
+        }
+        // do thread local compression
+        typename tbb::enumerable_thread_specific<compressor>::reference cp_local = cp.local();
+        zblock.blocksize = cp_local.compress(zblock.block.get(), MAX_ZBLOCKSIZE, 
+                                                ptr.block, MAX_BLOCKSIZE,
+                                                compress_level);
+        zblock.blocknumber = ptr.blocknumber;
+        return zblock;
+    }),
+    sequencer_node(this->myGraph,
+    [](const OrderedBlock & zblock) {
+        return zblock.blocknumber;
+    }),
+    writer_node(this->myGraph, tbb::flow::serial,
+    [this](OrderedBlock zblock) {
+        write_and_update(static_cast<uint32_t>(zblock.blocksize));
+        write_and_update(zblock.block.get(), zblock.blocksize & (~BLOCK_METADATA));
+
+        // return input zblock to available_zblocks
+        available_zblocks.push(zblock.block);
+
+        // return 0 to indicate success
+        return 0;
+    })
+    {    
         // connect computation graph
         tbb::flow::make_edge(compressor_node, sequencer_node);
         tbb::flow::make_edge(compressor_node_direct, sequencer_node);
@@ -308,27 +302,10 @@ struct BlockCompressReaderMT {
         return this->decompressor_node_routine(dp_local);
     }),
     sequencer_node(this->myGraph, 
-    [this](OrderedBlock block) {
-        TOUT("sequencer ", block.blocknumber, " with size ", block.blocksize);
-        // check if block has block assignment and is not already copy, and if so copy here
-        auto it = block_assignments.find(block.blocknumber);
-        if(it != block_assignments.end() && !block.is_already_copied()) {
-            TOUT("direct copy ", block.blocknumber, " with size ", block.blocksize);
-            // blocksize should always be MAX_BLOCKSIZE here if we are copying directly
-            std::memcpy(it->second, block.block.get(), block.blocksize);
-            // replace block with null pointer to indicate it has been copied and return block to available blocks
-            std::shared_ptr<char[]> swap_block;
-            std::swap(swap_block, block.block);
-            available_blocks.push(std::move(swap_block));
-        }
+    [](const OrderedBlock & block) {
         return block.blocknumber;
-    }) {
-        // pre-populate available blocks and zblocks queues
-        // for(int i = 0; i < nthreads-1; ++i) {
-        //     available_blocks.push(MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_BLOCKSIZE));
-        //     available_zblocks.push(MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_ZBLOCKSIZE));
-        // }
-        
+    })
+    {
         // connect computation graph
         tbb::flow::make_edge(reader_node, decompressor_node);
         reader_node.activate();
@@ -348,16 +325,16 @@ struct BlockCompressReaderMT {
         if(it != block_assignments.end()) {
             // blocksize should always be MAX_BLOCKSIZE here if we are copying directly
             block.blocksize = dp_local.decompress(it->second, MAX_BLOCKSIZE, zblock.block.get(), zblock.blocksize);
-            // auto blockhash = XXH64(it->second, block.blocksize, 0);
-            // TOUT("direct decompress ", zblock.blocknumber, " to address ", (void*)it->second, " from address ", (void*)zblock.block.get(), " with hash ", blockhash);
+            auto blockhash = XXH64(it->second, block.blocksize, 0);
+            TOUT("direct decompress ", zblock.blocknumber, " to address ", (void*)it->second, " from address ", (void*)zblock.block.get(), " with hash ", blockhash);
         } else {
             // get available block and decompress to block
             if(!available_blocks.try_pop(block.block)) {
                 block.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_BLOCKSIZE);
             }
             block.blocksize = dp_local.decompress(block.block.get(), MAX_BLOCKSIZE, zblock.block.get(), zblock.blocksize);
-            // auto blockhash = XXH64(block.block.get(), block.blocksize, 0);
-            // TOUT("decompress ", zblock.blocknumber, " to new block with address ", (void*)block.block.get(), " from address ", (void*)zblock.block.get(), " with hash ", blockhash);
+            auto blockhash = XXH64(block.block.get(), block.blocksize, 0);
+            TOUT("decompress ", zblock.blocknumber, " to new block with address ", (void*)block.block.get(), " from address ", (void*)zblock.block.get(), " with hash ", blockhash);
         }
         // check for decompression error
         if(decompressor::is_error(block.blocksize)) {
@@ -386,15 +363,16 @@ struct BlockCompressReaderMT {
                 // check if already copied, if so block is nullptr
                 // if its already copied then we do not need to set data_offset to 0 since it was already used
                 bool already_copied = block.is_already_copied();
-                if(already_copied) {
+                if(!already_copied) {
                     // put old block back in available_blocks
-                    std::swap(current_block, block.block);
-                    available_blocks.push(block.block);
+                    available_blocks.push(current_block);
+                    TOUT("recycling block ", blocks_processed, " with size ", current_blocksize, " address ", (void*)current_block.get());
+                    current_block = block.block;
                     // replace previous block with new block and increment blocks_processed
                 }
-                // auto blockhash = XXH64(current_block.get(), current_blocksize, 0);
-                // TOUT("get_new_block current block ", blocks_processed, " with size ", current_blocksize, " address ", (void*)current_block.get(), " already copied " , already_copied, " with hash ", blockhash);
                 current_blocksize = block.blocksize;
+                auto blockhash = XXH64(current_block.get(), current_blocksize, 0);
+                TOUT("get_new_block current block ", blocks_processed, " with size ", current_blocksize, " address ", (void*)current_block.get(), " already copied " , already_copied, " with hash ", blockhash);
                 data_offset = 0;
                 blocks_processed++;
                 return already_copied;
