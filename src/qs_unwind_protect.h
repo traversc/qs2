@@ -4,10 +4,6 @@
 #include <Rcpp.h>
 #include <csetjmp>
 
-#define SINGLE_ARG(...) __VA_ARGS__
-
-
-
 // struct Guardian {
 //     int x;
 //     Guardian() : x(0) {}

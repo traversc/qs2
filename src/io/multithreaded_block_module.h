@@ -8,6 +8,26 @@
 #include <tbb/flow_graph.h>
 #include <tbb/enumerable_thread_specific.h>
 
+#include <atomic>
+
+// single argument macro
+#define __SA__(...) __VA_ARGS__
+
+#if __cplusplus >= 201703L
+#define SUPPORTS_IF_CONSTEXPR 1
+#define DIRECT_MEM_SWITCH(if_true, if_false) \
+    if constexpr (direct_mem) {                         \
+        if_true;                                        \
+    } else {                                            \
+        if_false;                                       \
+    }
+#else
+#define SUPPORTS_IF_CONSTEXPR 0
+#define DIRECT_MEM_SWITCH(if_true, if_false) if_true;
+#endif
+
+
+
 struct OrderedBlock {
     std::shared_ptr<char[]> block;
     uint64_t blocksize;
@@ -31,7 +51,7 @@ struct OrderedPtr {
 // sequencer requires copy constructor for message, which means using shared_ptr
 // would be better if we could use unique_ptr
 // nthreads must be >= 2
-template <class stream_writer, class compressor, class hasher, ErrorType E>
+template <class stream_writer, class compressor, class hasher, ErrorType E, bool direct_mem>
 struct BlockCompressWriterMT {
     // template class objects
     stream_writer & myFile;
@@ -76,7 +96,7 @@ struct BlockCompressWriterMT {
     myGraph(this->tgc),
     compressor_node(this->myGraph, tbb::flow::unlimited, 
     [this](OrderedBlock block) {
-                    // get zblock from available_zblocks
+        // get zblock from available_zblocks
         OrderedBlock zblock;
         if(!available_zblocks.try_pop(zblock.block)) {
             zblock.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_ZBLOCKSIZE);
@@ -94,7 +114,7 @@ struct BlockCompressWriterMT {
     }),
     compressor_node_direct(this->myGraph, tbb::flow::unlimited, 
     [this](OrderedPtr ptr) {
-                    // get zblock from available_zblocks
+        // get zblock from available_zblocks
         OrderedBlock zblock;
         if(!available_zblocks.try_pop(zblock.block)) {
             zblock.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_ZBLOCKSIZE);
@@ -125,7 +145,9 @@ struct BlockCompressWriterMT {
     {    
         // connect computation graph
         tbb::flow::make_edge(compressor_node, sequencer_node);
-        tbb::flow::make_edge(compressor_node_direct, sequencer_node);
+        DIRECT_MEM_SWITCH(__SA__(
+            tbb::flow::make_edge(compressor_node_direct, sequencer_node);
+        ), ; /* Don't make edge if direct_mem = false */);
         tbb::flow::make_edge(sequencer_node, writer_node);
     }
     private:
@@ -172,18 +194,29 @@ struct BlockCompressWriterMT {
         while(current_pointer_consumed < len) {
             if(current_blocksize >= MAX_BLOCKSIZE) { flush(); }
             
-            if(current_blocksize == 0 && len - current_pointer_consumed >= MAX_BLOCKSIZE) {
-                compressor_node_direct.try_put(OrderedPtr(inbuffer + current_pointer_consumed, current_blocknumber));
-                current_blocknumber++;
-                current_pointer_consumed += MAX_BLOCKSIZE;
-                current_blocksize = 0;
-            } else {
-                uint64_t remaining_pointer_available = len - current_pointer_consumed;
-                uint64_t add_length = remaining_pointer_available < (MAX_BLOCKSIZE - current_blocksize) ? remaining_pointer_available : MAX_BLOCKSIZE-current_blocksize;
-                std::memcpy(current_block.get() + current_blocksize, inbuffer + current_pointer_consumed, add_length);
-                current_blocksize += add_length;
-                current_pointer_consumed += add_length;
-            }
+            DIRECT_MEM_SWITCH(
+                __SA__(
+                    if(current_blocksize == 0 && len - current_pointer_consumed >= MAX_BLOCKSIZE) {
+                        compressor_node_direct.try_put(OrderedPtr(inbuffer + current_pointer_consumed, current_blocknumber));
+                        current_blocknumber++;
+                        current_pointer_consumed += MAX_BLOCKSIZE;
+                        current_blocksize = 0;
+                    } else {
+                        uint64_t remaining_pointer_available = len - current_pointer_consumed;
+                        uint64_t add_length = remaining_pointer_available < (MAX_BLOCKSIZE - current_blocksize) ? remaining_pointer_available : MAX_BLOCKSIZE-current_blocksize;
+                        std::memcpy(current_block.get() + current_blocksize, inbuffer + current_pointer_consumed, add_length);
+                        current_blocksize += add_length;
+                        current_pointer_consumed += add_length;
+                    }
+                ),
+                __SA__(
+                    uint64_t remaining_pointer_available = len - current_pointer_consumed;
+                    uint64_t add_length = remaining_pointer_available < (MAX_BLOCKSIZE - current_blocksize) ? remaining_pointer_available : MAX_BLOCKSIZE-current_blocksize;
+                    std::memcpy(current_block.get() + current_blocksize, inbuffer + current_pointer_consumed, add_length);
+                    current_blocksize += add_length;
+                    current_pointer_consumed += add_length;
+                )
+            )
         }
     }
 
@@ -208,7 +241,7 @@ struct BlockCompressWriterMT {
     }
 };
 
-template <class stream_reader, class decompressor, ErrorType E> 
+template <class stream_reader, class decompressor, ErrorType E, bool direct_mem> 
 struct BlockCompressReaderMT {
     // template class objects
     stream_reader & myFile;
@@ -317,25 +350,28 @@ struct BlockCompressReaderMT {
         if(!ordered_zblocks.try_pop(zblock)) {
             return 0; // no available zblock, could be stolen by main thread
         }
-        TOUT("decompressor ", zblock.blocknumber, " with size ", zblock.blocksize);
-        
         OrderedBlock block;
-        // check for block assignment
-        auto it = block_assignments.find(zblock.blocknumber);
-        if(it != block_assignments.end()) {
-            // blocksize should always be MAX_BLOCKSIZE here if we are copying directly
-            block.blocksize = dp_local.decompress(it->second, MAX_BLOCKSIZE, zblock.block.get(), zblock.blocksize);
-            auto blockhash = XXH64(it->second, block.blocksize, 0);
-            TOUT("direct decompress ", zblock.blocknumber, " to address ", (void*)it->second, " from address ", (void*)zblock.block.get(), " with hash ", blockhash);
-        } else {
-            // get available block and decompress to block
-            if(!available_blocks.try_pop(block.block)) {
-                block.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_BLOCKSIZE);
-            }
-            block.blocksize = dp_local.decompress(block.block.get(), MAX_BLOCKSIZE, zblock.block.get(), zblock.blocksize);
-            auto blockhash = XXH64(block.block.get(), block.blocksize, 0);
-            TOUT("decompress ", zblock.blocknumber, " to new block with address ", (void*)block.block.get(), " from address ", (void*)zblock.block.get(), " with hash ", blockhash);
-        }
+        DIRECT_MEM_SWITCH(
+            __SA__(
+                auto it = block_assignments.find(zblock.blocknumber);
+                if(it != block_assignments.end()) {
+                    // blocksize should always be MAX_BLOCKSIZE here if we are copying directly
+                    block.blocksize = dp_local.decompress(it->second, MAX_BLOCKSIZE, zblock.block.get(), zblock.blocksize);
+                } else {
+                    // get available block and decompress to block
+                    if(!available_blocks.try_pop(block.block)) {
+                        block.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_BLOCKSIZE);
+                    }
+                    block.blocksize = dp_local.decompress(block.block.get(), MAX_BLOCKSIZE, zblock.block.get(), zblock.blocksize);
+                }
+            ),
+            __SA__(
+                if(!available_blocks.try_pop(block.block)) {
+                    block.block = MAKE_SHARED_BLOCK_ASSIGNMENT(MAX_BLOCKSIZE);
+                }
+                block.blocksize = dp_local.decompress(block.block.get(), MAX_BLOCKSIZE, zblock.block.get(), zblock.blocksize);
+            )
+        )
         // check for decompression error
         if(decompressor::is_error(block.blocksize)) {
             // don't throw error within graph
@@ -359,20 +395,27 @@ struct BlockCompressReaderMT {
         while( true ) {
             // try_get from sequencer queue until a new block is available
             if( sequencer_node.try_get(block) ) {
-                TOUT("get_new_block ", block.blocknumber, " with size ", block.blocksize, " address ", (void*)block.block.get());
                 // check if already copied, if so block is nullptr
                 // if its already copied then we do not need to set data_offset to 0 since it was already used
-                bool already_copied = block.is_already_copied();
-                if(!already_copied) {
-                    // put old block back in available_blocks
-                    available_blocks.push(current_block);
-                    TOUT("recycling block ", blocks_processed, " with size ", current_blocksize, " address ", (void*)current_block.get());
-                    current_block = block.block;
-                    // replace previous block with new block and increment blocks_processed
-                }
+                bool already_copied;
+                DIRECT_MEM_SWITCH(
+                    __SA__(
+                        already_copied = block.is_already_copied();
+                        if(!already_copied) {
+                            // put old block back in available_blocks
+                            available_blocks.push(current_block);
+                            current_block = block.block;
+                            // replace previous block with new block and increment blocks_processed
+                        }
+                    ),
+                    __SA__(
+                        already_copied = false;
+                        available_blocks.push(current_block);
+                        current_block = block.block;
+                    )
+                )
+
                 current_blocksize = block.blocksize;
-                auto blockhash = XXH64(current_block.get(), current_blocksize, 0);
-                TOUT("get_new_block current block ", blocks_processed, " with size ", current_blocksize, " address ", (void*)current_block.get(), " already copied " , already_copied, " with hash ", blockhash);
                 data_offset = 0;
                 blocks_processed++;
                 return already_copied;
@@ -413,7 +456,6 @@ struct BlockCompressReaderMT {
                 // it returns a reference to a new value with default value (nullptr)
                 // meaning assigning the assignment (outbuffer + bytes_accounted) is NOT atomic
                 // block_assignments[blocks_processed] = outbuffer + bytes_accounted;
-                TOUT("do_block_assignments ", blocks_processed, " to address ", (void*)(outbuffer + bytes_accounted));
                 block_assignments.insert(std::pair<uint64_t, char *>(blocks_processed, outbuffer + bytes_accounted));
                 bytes_accounted += MAX_BLOCKSIZE;
                 blocks_processed++;
@@ -423,7 +465,6 @@ struct BlockCompressReaderMT {
         }
     }
     void get_data(char * outbuffer, const uint64_t len) {
-        TOUT("get_data ", len, " with current_blocksize ", current_blocksize, " data_offset ", data_offset, " address ", (void*)current_block.get());
         if(current_blocksize - data_offset >= len) {
             std::memcpy(outbuffer, current_block.get()+data_offset, len);
             data_offset += len;
@@ -431,30 +472,50 @@ struct BlockCompressReaderMT {
             // remainder of current block, may be zero
             uint64_t bytes_accounted = current_blocksize - data_offset;
             std::memcpy(outbuffer, current_block.get()+data_offset, bytes_accounted);
-            // do block assignments first so worker threads can decompress directly into R buffer
-            do_block_assignments(len, bytes_accounted, blocks_processed, outbuffer);
-            while(bytes_accounted < len) {
-                if(len - bytes_accounted >= MAX_BLOCKSIZE) {
-                    bool already_copied = get_new_block();
-                    // check if block_already_copied (nullptr) and memcpy if it has not been
-                    if(!already_copied) {
-                        TOUT("memcpy full block blocknumber ", blocks_processed-1, " len ", len, " bytes_accounted ", bytes_accounted, " address ", (void*)(outbuffer + bytes_accounted));
+
+            DIRECT_MEM_SWITCH(
+                __SA__(
+                    // do block assignments first so worker threads can decompress directly into R buffer
+                    do_block_assignments(len, bytes_accounted, blocks_processed, outbuffer);
+                    while(len - bytes_accounted >= MAX_BLOCKSIZE) {
+                        bool already_copied = get_new_block();
+                        // check if block_already_copied (nullptr) and memcpy if it has not been
+                        if(!already_copied) {
+                            std::memcpy(outbuffer + bytes_accounted, current_block.get(), MAX_BLOCKSIZE);
+                        }
+                        bytes_accounted += MAX_BLOCKSIZE;
+                        data_offset = MAX_BLOCKSIZE;
+                    }
+                    if(len - bytes_accounted > 0) { // but less than MAX_BLOCKSIZE
+                        get_new_block();
+                        // if not enough bytes in block then something went wrong, throw error
+                        if(current_blocksize < len - bytes_accounted) {
+                            cleanup_and_throw("Corrupted block data");
+                        }
+                        std::memcpy(outbuffer + bytes_accounted, current_block.get(), len - bytes_accounted);
+                        data_offset = len - bytes_accounted;
+                        // bytes_accounted += data_offset; // no need to update since we are returning
+                    }
+                ),
+                __SA__(
+                    while(len - bytes_accounted >= MAX_BLOCKSIZE) {
+                        get_new_block();
                         std::memcpy(outbuffer + bytes_accounted, current_block.get(), MAX_BLOCKSIZE);
+                        bytes_accounted += MAX_BLOCKSIZE;
+                        data_offset = MAX_BLOCKSIZE;
                     }
-                    bytes_accounted += MAX_BLOCKSIZE;
-                    data_offset = MAX_BLOCKSIZE;
-                } else {
-                    get_new_block();
-                    // if not enough bytes in block then something went wrong, throw error
-                    if(current_blocksize < len - bytes_accounted) {
-                        cleanup_and_throw("Corrupted block data");
+                    if(len - bytes_accounted > 0) { // but less than MAX_BLOCKSIZE
+                        get_new_block();
+                        // if not enough bytes in block then something went wrong, throw error
+                        if(current_blocksize < len - bytes_accounted) {
+                            cleanup_and_throw("Corrupted block data");
+                        }
+                        std::memcpy(outbuffer + bytes_accounted, current_block.get(), len - bytes_accounted);
+                        data_offset = len - bytes_accounted;
+                        // bytes_accounted += data_offset; // no need to update since we are returning
                     }
-                    std::memcpy(outbuffer + bytes_accounted, current_block.get(), len - bytes_accounted);
-                    TOUT("memcpy partial block len ", len, " bytes_accounted ", bytes_accounted, " address ", (void*)current_block.get());
-                    data_offset = len - bytes_accounted;
-                    bytes_accounted += data_offset;
-                }
-            }
+                )
+            )
         }
     }
 
@@ -472,7 +533,6 @@ struct BlockCompressReaderMT {
 
     // Same as ST
     template<typename POD> POD get_pod() {
-        TOUT("get_pod ", sizeof(POD), " with current_blocksize ", current_blocksize, " data_offset ", data_offset, " address ", (void*)current_block.get());
         if(current_blocksize == data_offset) {
             get_new_block();
         }
@@ -482,21 +542,18 @@ struct BlockCompressReaderMT {
         POD pod;
         memcpy(&pod, current_block.get()+data_offset, sizeof(POD));
         data_offset += sizeof(POD);
-        TOUT("pod value ", (int64_t)pod);
         return pod;
     }
 
     // same as ST
     // unconditionally read from block without checking remaining length
     template<typename POD> POD get_pod_contiguous() {
-        TOUT("get_pod ", sizeof(POD), " with current_blocksize ", current_blocksize, " data_offset ", data_offset, " address ", (void*)current_block.get());
         if(current_blocksize - data_offset < sizeof(POD)) {
             cleanup_and_throw("Corrupted block data");
         }
         POD pod;
         memcpy(&pod, current_block.get()+data_offset, sizeof(POD));
         data_offset += sizeof(POD);
-        TOUT("pod value ", (int64_t)pod);
         return pod;
     }
 };

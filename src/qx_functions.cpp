@@ -24,7 +24,7 @@
 #define NTHREADS_ERROR_MSG "nthreads > 1 requires TBB, see the readme and vignette for details"
 
 #define DO_QS_SAVE(_BASE_CLASS_, _COMPRESSOR_, _HASHER_) \
-    _BASE_CLASS_ <OfStreamWriter, _COMPRESSOR_, _HASHER_, ErrorType::r_error> block_io(myFile, compress_level); \
+    _BASE_CLASS_ <OfStreamWriter, _COMPRESSOR_, _HASHER_, ErrorType::r_error, false> block_io(myFile, compress_level); \
     R_SerializeInit(&out, block_io); \
     qsSaveImplArgs args = {object, &out}; \
     DO_JMPBUF(); \
@@ -71,8 +71,8 @@ SEXP qs_save(SEXP object, const std::string & file, const int compress_level = 3
 
 // DO_UNWIND_PROTECT macro assigns SEXP output
 #define DO_QS_READ(_BASE_CLASS_, _DECOMPRESSOR_) \
-    _BASE_CLASS_ <IfStreamReader, _DECOMPRESSOR_, ErrorType::r_error> block_io(myFile); \
-    R_UnserializeInit< _BASE_CLASS_ <IfStreamReader, _DECOMPRESSOR_, ErrorType::r_error>>(&in, (R_pstream_data_t)(&block_io)); \
+    _BASE_CLASS_ <IfStreamReader, _DECOMPRESSOR_, ErrorType::r_error, false> block_io(myFile); \
+    R_UnserializeInit< _BASE_CLASS_ <IfStreamReader, _DECOMPRESSOR_, ErrorType::r_error, false>>(&in, (R_pstream_data_t)(&block_io)); \
     DO_JMPBUF(); \
     DO_UNWIND_PROTECT(qs_read_impl, decltype(block_io), in);
 
@@ -123,8 +123,8 @@ SEXP qs_read(const std::string & file, const bool validate_checksum = false, con
 }
 
 #define DO_QD_SAVE(_BASE_CLASS_, _COMPRESSOR_, _HASHER_) \
-    _BASE_CLASS_ <OfStreamWriter, _COMPRESSOR_, _HASHER_, ErrorType::cpp_error> writer(myFile, compress_level); \
-    QdataSerializer<_BASE_CLASS_<OfStreamWriter, _COMPRESSOR_, _HASHER_, ErrorType::cpp_error>> serializer(writer, warn_unsupported_types); \
+    _BASE_CLASS_ <OfStreamWriter, _COMPRESSOR_, _HASHER_, ErrorType::cpp_error, true> writer(myFile, compress_level); \
+    QdataSerializer<_BASE_CLASS_<OfStreamWriter, _COMPRESSOR_, _HASHER_, ErrorType::cpp_error, true>> serializer(writer, warn_unsupported_types); \
     serializer.write_object(object); \
     uint64_t hash = writer.finish(); \
     write_qx_hash(myFile, hash); \
@@ -168,8 +168,8 @@ SEXP qd_save(SEXP object, const std::string & file, const int compress_level = 3
 }
 
 #define DO_QD_READ(_BASE_CLASS_, _DECOMPRESSOR_) \
-    _BASE_CLASS_ <IfStreamReader, _DECOMPRESSOR_, ErrorType::cpp_error> reader(myFile); \
-    QdataDeserializer<_BASE_CLASS_<IfStreamReader, _DECOMPRESSOR_, ErrorType::cpp_error>> deserializer(reader, use_alt_rep); \
+    _BASE_CLASS_ <IfStreamReader, _DECOMPRESSOR_, ErrorType::cpp_error, true> reader(myFile); \
+    QdataDeserializer<_BASE_CLASS_<IfStreamReader, _DECOMPRESSOR_, ErrorType::cpp_error, true>> deserializer(reader, use_alt_rep); \
     SEXP output = deserializer.read_object(); \
     reader.finish(); \
     return output
